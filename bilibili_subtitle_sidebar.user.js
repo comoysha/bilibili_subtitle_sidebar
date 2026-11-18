@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站字幕侧边栏
 // @namespace    https://github.com/yourname/bilibili-subtitle-sidebar
-// @version      1.1.0
+// @version      1.1.1
 // @description  在B站视频页面右侧显示字幕列表,支持点击跳转、自动同步和复制全文
 // @author       YourName
 // @match        https://www.bilibili.com/video/*
@@ -14,6 +14,7 @@
 // @connect      *.hdslb.com
 // @connect      *
 // @run-at       document-idle
+// @noframes
 // ==/UserScript==
 
 (function() {
@@ -260,6 +261,7 @@
     let currentSubtitles = [];
     let currentIndex = -1;
     let videoElement = null;
+    let activeLoad = null;
 
     // ==================== 工具函数 ====================
 
@@ -273,82 +275,79 @@
     }
 
     /**
-     * 从页面获取视频信息
+     * 识别当前视频地址
      */
-    function getVideoInfo() {
-        return new Promise((resolve) => {
-            try {
-                console.log('[字幕侧边栏] 开始获取视频信息...');
+    function getVideoRoute() {
+        const url = new URL(location.href);
+        const video = url.pathname.match(/^\/video\/(BV[0-9A-Za-z]+|av\d+)\/?$/);
+        if (video) {
+            const id = video[1];
+            const part = Number(url.searchParams.get('p') || 1);
+            if (!Number.isSafeInteger(part) || part < 1) return null;
+            const type = id.startsWith('BV') ? 'bvid' : 'aid';
+            return { key: `${id}:${part}`, type, id: type === 'aid' ? id.slice(2) : id, part };
+        }
 
-                // 使用 unsafeWindow 访问页面的全局变量
-                const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-                console.log('[字幕侧边栏] unsafeWindow 可用:', typeof unsafeWindow !== 'undefined');
-                console.log('[字幕侧边栏] pageWindow.__INITIAL_STATE__ 存在:', !!pageWindow.__INITIAL_STATE__);
+        const bangumi = url.pathname.match(/^\/bangumi\/play\/(ep|ss)(\d+)\/?$/);
+        if (!bangumi) return null;
+        const [, type, id] = bangumi;
+        if (type === 'ep') return { key: `ep${id}`, type, id };
 
-                const initialState = pageWindow.__INITIAL_STATE__;
+        const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        const arc = pageWindow.__playinfo__?.result?.arc;
+        return arc?.aid && arc?.cid
+            ? { key: `ss${id}:${arc.aid}:${arc.cid}`, type, id, aid: arc.aid, cid: arc.cid }
+            : null;
+    }
 
-                if (!initialState) {
-                    console.error('[字幕侧边栏] 无法获取 __INITIAL_STATE__');
-                    resolve(null);
-                    return;
-                }
+    async function getVideoInfo(route) {
+        if (route.type === 'bvid' || route.type === 'aid') {
+            const { data } = await requestJson(`https://api.bilibili.com/x/web-interface/view?${route.type}=${route.id}`);
+            if (String(data?.[route.type]) !== route.id) return null;
+            const part = data.pages?.find(page => Number(page.page) === route.part);
+            return part?.cid && data.aid ? { aid: data.aid, cid: part.cid } : null;
+        }
 
-                console.log('[字幕侧边栏] initialState 键:', Object.keys(initialState).slice(0, 20).join(', '));
-
-                const videoData = initialState.videoData || initialState.view?.videoData || {};
-                console.log('[字幕侧边栏] videoData:', videoData);
-
-                const aid = videoData.aid || initialState.aid;
-                const cid = videoData.cid || initialState.cid;
-                const bvid = videoData.bvid || initialState.bvid;
-
-                console.log('[字幕侧边栏] 提取的 aid:', aid, 'cid:', cid, 'bvid:', bvid);
-
-                if (!aid || !cid) {
-                    console.error('[字幕侧边栏] 无法获取 aid 或 cid');
-                    console.log('[字幕侧边栏] initialState 全部内容:', initialState);
-                    resolve(null);
-                    return;
-                }
-
-                resolve({ aid, cid, bvid });
-            } catch (error) {
-                console.error('[字幕侧边栏] 获取视频信息失败:', error);
-                resolve(null);
-            }
-        });
+        const param = route.type === 'ep' ? 'ep_id' : 'season_id';
+        const { result } = await requestJson(`https://api.bilibili.com/pgc/view/web/season?${param}=${route.id}`);
+        if (!result || (route.type === 'ss' && String(result.season_id) !== route.id)) return null;
+        const episodes = [...(result.episodes || []), ...(result.section || []).flatMap(section => section.episodes || [])];
+        const episode = episodes.find(item => route.type === 'ep'
+            ? String(item.id) === route.id
+            : String(item.aid) === String(route.aid) && String(item.cid) === String(route.cid));
+        return episode?.aid && episode?.cid ? { aid: episode.aid, cid: episode.cid } : null;
     }
 
     // ==================== API 调用 ====================
 
     /**
-     * 获取字幕列表
+     * 请求 JSON 数据
      */
-    function fetchSubtitleList(aid, cid) {
+    function requestJson(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
-                url: `https://api.bilibili.com/x/player/wbi/v2?aid=${aid}&cid=${cid}`,
+                url,
+                timeout: 15000,
                 headers: {
                     'Accept': 'application/json'
                 },
                 onload: (response) => {
                     try {
-                        const data = JSON.parse(response.responseText);
-                        if (data.code === 0) {
-                            const subtitles = data.data.subtitle?.subtitles || [];
-                            console.log(`[字幕侧边栏] 找到 ${subtitles.length} 个字幕`);
-                            resolve(subtitles);
-                        } else {
-                            reject(new Error(data.message || '获取字幕列表失败'));
+                        if (response.status < 200 || response.status >= 300) {
+                            throw new Error(`HTTP ${response.status}`);
                         }
+                        const data = JSON.parse(response.responseText);
+                        if (data.code != null && data.code !== 0) {
+                            throw new Error(data.message || `API ${data.code}`);
+                        }
+                        resolve(data);
                     } catch (error) {
                         reject(error);
                     }
                 },
-                onerror: (error) => {
-                    reject(new Error('网络请求失败'));
-                }
+                onerror: () => reject(new Error('网络请求失败')),
+                ontimeout: () => reject(new Error('网络请求超时'))
             });
         });
     }
@@ -356,31 +355,10 @@
     /**
      * 获取字幕内容
      */
-    function fetchSubtitleContent(subtitleUrl) {
-        return new Promise((resolve, reject) => {
-            const fullUrl = subtitleUrl.startsWith('//') ? 'https:' + subtitleUrl : subtitleUrl;
-
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: fullUrl,
-                headers: {
-                    'Accept': 'application/json'
-                },
-                onload: (response) => {
-                    try {
-                        const data = JSON.parse(response.responseText);
-                        const body = data.body || [];
-                        console.log(`[字幕侧边栏] 加载字幕内容: ${body.length} 条`);
-                        resolve(body);
-                    } catch (error) {
-                        reject(error);
-                    }
-                },
-                onerror: (error) => {
-                    reject(new Error('下载字幕内容失败'));
-                }
-            });
-        });
+    async function fetchSubtitleContent(subtitleUrl) {
+        const fullUrl = subtitleUrl.startsWith('//') ? 'https:' + subtitleUrl : subtitleUrl;
+        const { body } = await requestJson(fullUrl);
+        return Array.isArray(body) ? body : [];
     }
 
     // ==================== DOM 操作 ====================
@@ -441,6 +419,7 @@
      * 复制所有字幕到剪贴板
      */
     function copyAllSubtitles() {
+        if (!isCurrentLoad(activeLoad)) return;
         if (!currentSubtitles || currentSubtitles.length === 0) {
             showToast('没有可复制的字幕');
             return;
@@ -546,12 +525,13 @@
      * 切换侧边栏显示/隐藏
      */
     function toggleSidebar() {
+        if (!isCurrentLoad(activeLoad)) return;
         sidebarVisible = !sidebarVisible;
-        const sidebar = document.querySelector('.subtitle-sidebar');
+        let sidebar = document.querySelector('.subtitle-sidebar');
 
         if (sidebarVisible) {
             if (!sidebar) {
-                createSidebar();
+                sidebar = createSidebar();
                 if (currentSubtitles.length > 0) {
                     renderSubtitles(currentSubtitles);
                 }
@@ -568,6 +548,7 @@
      * 处理字幕点击事件
      */
     function handleSubtitleClick(event) {
+        if (!isCurrentLoad(activeLoad)) return;
         const item = event.currentTarget;
         const from = parseFloat(item.dataset.from);
 
@@ -613,25 +594,16 @@
      * 同步字幕高亮和滚动
      */
     function syncSubtitles() {
-        if (!videoElement || currentSubtitles.length === 0) return;
-
-        let currentIndex = -1;
-
-        videoElement.addEventListener('timeupdate', () => {
-            const currentTime = videoElement.currentTime;
-
-            // 查找当前字幕
-            const index = currentSubtitles.findIndex(sub =>
-                currentTime >= sub.from && currentTime <= sub.to
-            );
-
-            // 如果字幕发生变化
-            if (index !== currentIndex && index !== -1) {
-                currentIndex = index;
-                highlightSubtitle(index);
-                scrollToSubtitle(index);
-            }
-        });
+        if (!videoElement || currentSubtitles.length === 0 || !isCurrentLoad(activeLoad)) return;
+        const currentTime = videoElement.currentTime;
+        const index = currentSubtitles.findIndex(sub =>
+            currentTime >= sub.from && currentTime <= sub.to
+        );
+        if (index !== currentIndex) {
+            currentIndex = index;
+            highlightSubtitle(index);
+            scrollToSubtitle(index);
+        }
     }
 
     // ==================== 等待元素加载 ====================
@@ -639,38 +611,12 @@
     /**
      * 等待视频元素加载
      */
-    function waitForVideo(callback, timeout = 10000) {
-        const video = document.querySelector('.bpx-player-container video') ||
-                      document.querySelector('video');
-
-        if (video) {
-            callback(video);
-            return;
-        }
-
-        const startTime = Date.now();
-
-        const observer = new MutationObserver(() => {
-            const video = document.querySelector('.bpx-player-container video') ||
-                          document.querySelector('video');
-
-            if (video) {
-                observer.disconnect();
-                callback(video);
-                return;
-            }
-
-            // 超时检查
-            if (Date.now() - startTime > timeout) {
-                observer.disconnect();
-                console.error('[字幕侧边栏] 等待视频元素超时');
-            }
-        });
-
-        observer.observe(document.documentElement, {
-            childList: true,
-            subtree: true
-        });
+    function bindVideo(video) {
+        if (video === videoElement) return;
+        videoElement?.removeEventListener('timeupdate', syncSubtitles);
+        videoElement = video;
+        videoElement?.addEventListener('timeupdate', syncSubtitles);
+        syncSubtitles();
     }
 
     // ==================== 主初始化流程 ====================
@@ -678,100 +624,67 @@
     /**
      * 检查并获取字幕
      */
-    async function checkAndFetchSubtitles(aid, cid) {
+    async function loadSubtitles(load, route) {
         try {
-            console.log(`[字幕侧边栏] 开始检查字幕: aid=${aid}, cid=${cid}`);
+            const video = await getVideoInfo(route);
+            if (!video || !isCurrentLoad(load)) return;
 
-            // 获取字幕列表
-            const subtitleList = await fetchSubtitleList(aid, cid);
-
-            if (!subtitleList || subtitleList.length === 0) {
-                console.log('[字幕侧边栏] 该视频没有字幕');
-                return null;
+            const { aid, cid } = video;
+            const { data } = await requestJson(`https://api.bilibili.com/x/player/wbi/v2?aid=${aid}&cid=${cid}`);
+            if (!isCurrentLoad(load)) return;
+            if ((data?.aid != null && String(data.aid) !== String(aid)) ||
+                (data?.cid != null && String(data.cid) !== String(cid))) {
+                throw new Error('字幕列表不属于当前视频');
             }
-
-            // 优先选择中文自动生成字幕(ai-zh),否则选择第一个
+            const subtitleList = data?.subtitle?.subtitles || [];
             const targetSubtitle = subtitleList.find(s => s.lan === 'ai-zh') || subtitleList[0];
-            console.log(`[字幕侧边栏] 选择字幕: ${targetSubtitle.lan_doc || targetSubtitle.lan}`);
-
-            // 下载字幕内容
+            if (!targetSubtitle?.subtitle_url) return;
             const subtitles = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+            if (!isCurrentLoad(load) || subtitles.length === 0) return;
 
-            return subtitles;
-
+            currentSubtitles = subtitles;
+            createToggleButton();
+            createSidebar();
+            renderSubtitles(subtitles);
+            syncSubtitles();
         } catch (error) {
-            console.error('[字幕侧边栏] 获取字幕失败:', error);
-            return null;
+            if (isCurrentLoad(load)) load.failed = true;
+            console.error('[字幕侧边栏] 获取字幕失败:', load.key, error);
         }
     }
 
-    /**
-     * 初始化脚本
-     */
-    async function init() {
-        console.log('[字幕侧边栏] ========================================');
-        console.log('[字幕侧边栏] 初始化开始...');
-        console.log('[字幕侧边栏] 当前 URL:', location.href);
+    function isCurrentLoad(load) {
+        return Boolean(load && activeLoad === load && getVideoRoute()?.key === load.key);
+    }
 
-        // 检查是否在视频页面
-        const isVideoPage = location.href.match(/bilibili\.com\/(video|bangumi\/play)/);
-        console.log('[字幕侧边栏] 是否视频页面:', !!isVideoPage);
-
-        if (!isVideoPage) {
-            console.log('[字幕侧边栏] 非视频页面,跳过初始化');
-            return;
-        }
-
-        // 获取视频信息
-        console.log('[字幕侧边栏] 等待获取视频信息...');
-        const videoInfo = await getVideoInfo();
-
-        if (!videoInfo) {
-            console.error('[字幕侧边栏] 无法获取视频信息,终止初始化');
-            return;
-        }
-
-        console.log(`[字幕侧边栏] 视频信息: aid=${videoInfo.aid}, cid=${videoInfo.cid}, bvid=${videoInfo.bvid}`);
-
-        // 等待视频元素加载
-        console.log('[字幕侧边栏] 等待视频元素...');
-        waitForVideo(async (video) => {
-            console.log('[字幕侧边栏] ✓ 视频元素已加载');
-            videoElement = video;
-
-            // 检查并获取字幕
-            console.log('[字幕侧边栏] 开始获取字幕...');
-            const subtitles = await checkAndFetchSubtitles(videoInfo.aid, videoInfo.cid);
-
-            console.log('[字幕侧边栏] 字幕获取结果:', subtitles ? `${subtitles.length} 条` : 'null');
-
-            if (subtitles && subtitles.length > 0) {
-                currentSubtitles = subtitles;
-                console.log(`[字幕侧边栏] ✓ 成功加载 ${subtitles.length} 条字幕`);
-
-                // 创建浮动按钮
-                console.log('[字幕侧边栏] 创建浮动按钮...');
-                createToggleButton();
-
-                // 创建侧边栏(但不显示)
-                console.log('[字幕侧边栏] 创建侧边栏...');
-                createSidebar();
-                renderSubtitles(subtitles);
-
-                // 启动字幕同步
-                console.log('[字幕侧边栏] 启动字幕同步...');
-                syncSubtitles();
-
-                console.log('[字幕侧边栏] ✓✓✓ 初始化完成 ✓✓✓');
-            } else {
-                console.log('[字幕侧边栏] ✗ 视频无字幕,不显示浮动按钮');
+    function refreshVideo(retry = false) {
+        const route = getVideoRoute();
+        if (route?.key !== activeLoad?.key || (retry && activeLoad?.failed)) {
+            activeLoad = null;
+            currentSubtitles = [];
+            currentIndex = -1;
+            sidebarVisible = false;
+            document.querySelector('.subtitle-toggle-btn')?.remove();
+            document.querySelector('.subtitle-sidebar')?.remove();
+            if (route) {
+                activeLoad = { key: route.key, failed: false };
+                void loadSubtitles(activeLoad, route);
             }
-        });
+        }
+        bindVideo(route ? document.querySelector('.bpx-player-container video') || document.querySelector('video') : null);
     }
 
     // ==================== 启动 ====================
 
-    // 延迟启动,确保页面加载完成
-    setTimeout(init, 1000);
+    const refreshVisibleVideo = () => {
+        if (!document.hidden) refreshVideo(true);
+    };
+    document.addEventListener('visibilitychange', refreshVisibleVideo);
+    window.addEventListener('pageshow', refreshVisibleVideo);
+    window.addEventListener('popstate', () => refreshVideo());
+    setInterval(() => {
+        if (!document.hidden) refreshVideo();
+    }, 500);
+    refreshVisibleVideo();
 
 })();
